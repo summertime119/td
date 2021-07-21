@@ -1,0 +1,36 @@
+name: CI
+
+# Controls when the workflow will run
+on:
+  push:
+    branches: [ci-m1-support]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Install deps
+        run: brew install gperf cmake coreutils
+    
+      - name: Build Openssl
+        run: |
+          cd td/example/ios
+          ./build-openssl.sh
+
+      - name: Build td
+        run: |
+          cd td/example/ios
+          ./build.sh
+
+      - name: Upload build dir
+        uses: actions/upload-artifact@v2
+        with:
+          name: ios
+          path: td/example/ios
+          if-no-files-found: error
