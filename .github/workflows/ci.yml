@@ -20,17 +20,17 @@ jobs:
     
       - name: Build Openssl
         run: |
-          cd td/example/ios
+          cd example/ios
           ./build-openssl.sh
 
       - name: Build td
         run: |
-          cd td/example/ios
+          cd example/ios
           ./build.sh
 
       - name: Upload build dir
         uses: actions/upload-artifact@v2
         with:
           name: ios
-          path: td/example/ios
+          path: example/ios
           if-no-files-found: error
