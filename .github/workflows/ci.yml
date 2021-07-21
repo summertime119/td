@@ -28,9 +28,16 @@ jobs:
           cd example/ios
           ./build.sh
 
-      - name: Upload build dir
+      - name: Upload tdjson dir
         uses: actions/upload-artifact@v2
         with:
-          name: ios
-          path: example/ios
+          name: tdjson
+          path: example/ios/tdjson
+          if-no-files-found: error
+
+      - name: Upload third_party dir
+        uses: actions/upload-artifact@v2
+        with:
+          name: third_party
+          path: example/ios/third_party
           if-no-files-found: error
