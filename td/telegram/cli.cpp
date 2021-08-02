@@ -2604,11 +2604,12 @@ class CliClient final : public Actor {
     } else if (op == "gmlink") {
       string chat_id;
       string message_id;
+      int32 media_timestamp;
       bool for_album;
       bool for_comment;
-      get_args(args, chat_id, message_id, for_album, for_comment);
+      get_args(args, chat_id, message_id, media_timestamp, for_album, for_comment);
       send_request(td_api::make_object<td_api::getMessageLink>(as_chat_id(chat_id), as_message_id(message_id),
-                                                               for_album, for_comment));
+                                                               media_timestamp, for_album, for_comment));
     } else if (op == "gmec") {
       string chat_id;
       string message_id;
@@ -2666,6 +2667,11 @@ class CliClient final : public Actor {
       }
     } else if (op == "cdf") {
       send_request(td_api::make_object<td_api::cancelDownloadFile>(as_file_id(args), false));
+    } else if (op == "gsfn") {
+      string file_id;
+      string directory_name;
+      get_args(args, file_id, directory_name);
+      send_request(td_api::make_object<td_api::getSuggestedFileName>(as_file_id(file_id), directory_name));
     } else if (op == "uf" || op == "ufs" || op == "ufse") {
       string file_path;
       int32 priority;
@@ -3618,7 +3624,7 @@ class CliClient final : public Actor {
       string video_path;
       get_args(args, chat_id, video_path);
       send_message(chat_id,
-                   td_api::make_object<td_api::inputMessageVideoNote>(as_input_file(video_path), nullptr, 1, 5));
+                   td_api::make_object<td_api::inputMessageVideoNote>(as_input_file(video_path), nullptr, 10, 5));
     } else if (op == "svenue") {
       string chat_id;
       string latitude;

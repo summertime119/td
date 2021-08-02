@@ -215,7 +215,7 @@ Result<BufferSlice> SecretChatActor::create_encrypted_message(int32 my_in_seq_no
   auto out_seq_no = my_out_seq_no * 2 - 1 - auth_state_.x;
 
   auto layer = current_layer();
-  BufferSlice random_bytes(32);
+  BufferSlice random_bytes(31);
   Random::secure_bytes(random_bytes.as_slice().ubegin(), random_bytes.size());
   auto message_with_layer = secret_api::make_object<secret_api::decryptedMessageLayer>(
       std::move(random_bytes), layer, in_seq_no, out_seq_no, std::move(message));
@@ -797,7 +797,9 @@ Result<std::tuple<uint64, BufferSlice, int32>> SecretChatActor::decrypt(BufferSl
     info.is_creator = auth_state_.x == 0;
     r_read_result = mtproto::Transport::read(data, *auth_key, &info);
     if (i + 1 != versions.size() && r_read_result.is_error()) {
-      LOG(WARNING) << tag("mtproto", mtproto_version) << " decryption failed " << r_read_result.error();
+      if (config_state_.his_layer >= static_cast<int32>(SecretChatLayer::Mtproto2)) {
+        LOG(WARNING) << tag("mtproto", mtproto_version) << " decryption failed " << r_read_result.error();
+      }
       continue;
     }
     break;
@@ -1236,11 +1238,6 @@ Status SecretChatActor::do_inbound_message_decrypted(unique_ptr<log_event::Inbou
   auto qts_promise = std::move(message->promise);
 
   // process message
-  tl_object_ptr<telegram_api::encryptedFile> file;
-  if (message->has_encrypted_file) {
-    file = message->file.as_encrypted_file();
-  }
-
   if (message->decrypted_message_layer->message_->get_id() == secret_api::decryptedMessage46::ID) {
     auto old = move_tl_object_as<secret_api::decryptedMessage46>(message->decrypted_message_layer->message_);
     old->flags_ &= ~secret_api::decryptedMessage::GROUPED_ID_MASK;  // just in case
@@ -1264,7 +1261,8 @@ Status SecretChatActor::do_inbound_message_decrypted(unique_ptr<log_event::Inbou
     auto decrypted_message =
         move_tl_object_as<secret_api::decryptedMessage>(message->decrypted_message_layer->message_);
     context_->on_inbound_message(get_user_id(), MessageId(ServerMessageId(message->message_id)), message->date,
-                                 std::move(file), std::move(decrypted_message), std::move(save_message_finish));
+                                 std::move(message->file), std::move(decrypted_message),
+                                 std::move(save_message_finish));
   } else if (message->decrypted_message_layer->message_->get_id() == secret_api::decryptedMessageService::ID) {
     auto decrypted_message_service =
         move_tl_object_as<secret_api::decryptedMessageService>(message->decrypted_message_layer->message_);
@@ -1616,31 +1614,24 @@ void SecretChatActor::on_outbound_send_message_result(NetQueryPtr query, Promise
       }
       case telegram_api::messages_sentEncryptedFile::ID: {
         auto sent = move_tl_object_as<telegram_api::messages_sentEncryptedFile>(result);
-        std::function<telegram_api::object_ptr<telegram_api::EncryptedFile>()> get_file;
-        telegram_api::downcast_call(
-            *sent->file_, overloaded(
-                              [&](telegram_api::encryptedFileEmpty &) {
-                                state->message->file = log_event::EncryptedInputFile::from_input_encrypted_file(
-                                    telegram_api::inputEncryptedFileEmpty());
-                                get_file = [] {
-                                  return telegram_api::make_object<telegram_api::encryptedFileEmpty>();
-                                };
-                              },
-                              [&](telegram_api::encryptedFile &file) {
-                                state->message->file = log_event::EncryptedInputFile::from_input_encrypted_file(
-                                    telegram_api::inputEncryptedFile(file.id_, file.access_hash_));
-                                get_file = [id = file.id_, access_hash = file.access_hash_, size = file.size_,
-                                            dc_id = file.dc_id_, key_fingerprint = file.key_fingerprint_] {
-                                  return telegram_api::make_object<telegram_api::encryptedFile>(id, access_hash, size,
-                                                                                                dc_id, key_fingerprint);
-                                };
-                              }));
-
-        state->send_result_ = [this, random_id = state->message->random_id,
-                               message_id = MessageId(ServerMessageId(state->message->message_id)), date = sent->date_,
-                               get_file = std::move(get_file)](Promise<> promise) {
-          this->context_->on_send_message_ok(random_id, message_id, date, get_file(), std::move(promise));
-        };
+        auto file = EncryptedFile::get_encrypted_file(std::move(sent->file_));
+        if (file == nullptr) {
+          state->message->file = log_event::EncryptedInputFile::from_input_encrypted_file(nullptr);
+          state->send_result_ = [this, random_id = state->message->random_id,
+                                 message_id = MessageId(ServerMessageId(state->message->message_id)),
+                                 date = sent->date_](Promise<> promise) {
+            this->context_->on_send_message_ok(random_id, message_id, date, nullptr, std::move(promise));
+          };
+        } else {
+          state->message->file = log_event::EncryptedInputFile::from_input_encrypted_file(
+              make_tl_object<telegram_api::inputEncryptedFile>(file->id_, file->access_hash_));
+          state->send_result_ = [this, random_id = state->message->random_id,
+                                 message_id = MessageId(ServerMessageId(state->message->message_id)),
+                                 date = sent->date_, file = *file](Promise<> promise) {
+            this->context_->on_send_message_ok(random_id, message_id, date, make_unique<EncryptedFile>(file),
+                                               std::move(promise));
+          };
+        }
         state->send_result_(std::move(send_message_finish_promise));
         return;
       }
@@ -1933,13 +1924,13 @@ void SecretChatActor::get_dh_config() {
   }
 
   auto version = auth_state_.dh_config.version;
-  int32 random_length = 0;
+  int32 random_length = 256;  // ignored server-side, always returns 256 random bytes
   auto query = create_net_query(QueryType::DhConfig, telegram_api::messages_getDhConfig(version, random_length));
   context_->send_net_query(std::move(query), actor_shared(this), false);
 }
 
 Status SecretChatActor::on_dh_config(NetQueryPtr query) {
-  LOG(INFO) << "Got dh config";
+  LOG(INFO) << "Got DH config";
   TRY_RESULT(config, fetch_result<telegram_api::messages_getDhConfig>(std::move(query)));
   downcast_call(*config, [&](auto &obj) { this->on_dh_config(obj); });
   TRY_STATUS(mtproto::DhHandshake::check_config(auth_state_.dh_config.g, auth_state_.dh_config.prime,

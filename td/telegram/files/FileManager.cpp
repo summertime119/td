@@ -920,6 +920,7 @@ bool FileManager::are_modification_times_equal(int64 old_mtime, int64 new_mtime)
 Status FileManager::check_local_location(FullLocalFileLocation &location, int64 &size, bool skip_file_size_checks) {
   constexpr int64 MAX_THUMBNAIL_SIZE = 200 * (1 << 10) - 1 /* 200 KB - 1 B */;
   constexpr int64 MAX_PHOTO_SIZE = 10 * (1 << 20) /* 10 MB */;
+  constexpr int64 DEFAULT_VIDEO_NOTE_SIZE_MAX = 12 * (1 << 20) /* 12 MB */;
 
   if (location.path_.empty()) {
     return Status::Error(400, "File must have non-empty path");
@@ -967,13 +968,17 @@ Status FileManager::check_local_location(FullLocalFileLocation &location, int64 
     return Status::Error(400, PSLICE() << "File \"" << location.path_ << "\" is too big for a thumbnail "
                                        << tag("size", format::as_size(size)));
   }
-  if (location.file_type_ == FileType::Photo && size > MAX_PHOTO_SIZE) {
-    return Status::Error(400, PSLICE() << "File \"" << location.path_ << "\" is too big for a photo "
-                                       << tag("size", format::as_size(size)));
-  }
   if (size > MAX_FILE_SIZE) {
+    return Status::Error(400, PSLICE() << "File \"" << location.path_ << "\" of size " << size << " bytes is too big");
+  }
+  if (location.file_type_ == FileType::Photo && size > MAX_PHOTO_SIZE) {
     return Status::Error(
-        400, PSLICE() << "File \"" << location.path_ << "\" is too big " << tag("size", format::as_size(size)));
+        400, PSLICE() << "File \"" << location.path_ << "\" of size " << size << " bytes is too big for a photo");
+  }
+  if (location.file_type_ == FileType::VideoNote &&
+      size > G()->shared_config().get_option_integer("video_note_size_max", DEFAULT_VIDEO_NOTE_SIZE_MAX)) {
+    return Status::Error(
+        400, PSLICE() << "File \"" << location.path_ << "\" of size " << size << " bytes is too big for a video note");
   }
   return Status::OK();
 }
@@ -1036,8 +1041,7 @@ bool FileManager::try_fix_partial_local_location(FileNodePtr node) {
 }
 
 FileManager::FileIdInfo *FileManager::get_file_id_info(FileId file_id) {
-  LOG_CHECK(0 <= file_id.get() && file_id.get() < static_cast<int32>(file_id_info_.size()))
-      << file_id << " " << file_id_info_.size();
+  CHECK(static_cast<size_t>(file_id.get()) < file_id_info_.size());
   return &file_id_info_[file_id.get()];
 }
 
@@ -1472,7 +1476,14 @@ Result<FileId> FileManager::merge(FileId x_file_id, FileId y_file_id, bool no_sy
     return std::accumulate(node->file_ids_.begin(), node->file_ids_.end(), 0,
                            [](const auto &x, const auto &y) { return x + (y.get_remote() != 0); });
   };
-  if (count_local(x_node) + count_local(y_node) > 100) {
+  auto x_local_file_ids = count_local(x_node);
+  auto y_local_file_ids = count_local(y_node);
+  if (x_local_file_ids + y_local_file_ids > 100) {
+  }
+
+  if (y_node->file_ids_.size() >= 100 || x_node->file_ids_.size() >= 100) {
+    LOG(INFO) << "Merge files with " << x_local_file_ids << '/' << x_node->file_ids_.size() << " and "
+              << y_local_file_ids << '/' << y_node->file_ids_.size() << " file IDs";
   }
 
   FileNodePtr nodes[] = {x_node, y_node, x_node};
@@ -1637,8 +1648,7 @@ Result<FileId> FileManager::merge(FileId x_file_id, FileId y_file_id, bool no_sy
 
   for (auto file_id : other_node->file_ids_) {
     auto file_id_info = get_file_id_info(file_id);
-    LOG_CHECK(file_id_info->node_id_ == node_ids[other_node_i])
-        << node_ids[node_i] << " " << node_ids[other_node_i] << " " << file_id << " " << file_id_info->node_id_;
+    CHECK(file_id_info->node_id_ == node_ids[other_node_i]);
     file_id_info->node_id_ = node_ids[node_i];
     send_updates_flag |= file_id_info->send_updates_flag_;
   }
@@ -1650,7 +1660,7 @@ Result<FileId> FileManager::merge(FileId x_file_id, FileId y_file_id, bool no_sy
     node->on_info_changed();
   }
 
-  // Check is some download/upload queries are ready
+  // Check if some download/upload queries are ready
   for (auto file_id : vector<FileId>(node->file_ids_)) {
     auto *info = get_file_id_info(file_id);
     if (info->download_priority_ != 0 && file_view.has_local_location()) {
@@ -3036,6 +3046,11 @@ Result<FileId> FileManager::check_input_file_id(FileType type, Result<FileId> re
   if (!file_view.has_remote_location()) {
     // TODO why not return file_id here? We will dup it anyway
     // But it will not be duped if has_input_media(), so for now we can't return main_file_id
+
+    if (file_view.has_url() && !is_encrypted) {
+      // URLs in non-secret chats never needs to be reuploaded, so they don't need to be duped
+      return file_node->main_file_id_;
+    }
     return dup_file_id(file_id);
   }
 
@@ -3105,7 +3120,7 @@ Result<FileId> FileManager::get_input_file_id(FileType type, const tl_object_ptr
         string hash;
         if (G()->shared_config().get_option_boolean("reuse_uploaded_photos_by_hash") && new_type == FileType::Photo) {
           auto r_stat = stat(path);
-          if (r_stat.is_ok() && r_stat.ok().size_ > 0 && r_stat.ok().size_ < 5000000) {
+          if (r_stat.is_ok() && r_stat.ok().size_ > 0 && r_stat.ok().size_ < 11000000) {
             auto r_file_content = read_file_str(path, r_stat.ok().size_);
             if (r_file_content.is_ok()) {
               hash = sha256(r_file_content.ok());
@@ -3832,6 +3847,18 @@ FullRemoteFileLocation *FileManager::get_remote(int32 key) {
     return nullptr;
   }
   return &remote_location_info_.get(key).remote_;
+}
+
+Result<string> FileManager::get_suggested_file_name(FileId file_id, const string &directory) {
+  if (!file_id.is_valid()) {
+    return Status::Error(400, "Invalid file identifier");
+  }
+  auto node = get_sync_file_node(file_id);
+  if (!node) {
+    return Status::Error(400, "Wrong file identifier");
+  }
+
+  return ::td::get_suggested_file_name(directory, PathView(node->suggested_path()).file_name());
 }
 
 void FileManager::hangup() {

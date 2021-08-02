@@ -485,7 +485,7 @@ class GetDeepLinkInfoQuery final : public Td::ResultHandler {
         }
         FormattedText text{std::move(info->message_), std::move(entities)};
         return promise_.set_value(
-            td_api::make_object<td_api::deepLinkInfo>(get_formatted_text_object(text), need_update));
+            td_api::make_object<td_api::deepLinkInfo>(get_formatted_text_object(text, true), need_update));
       }
       default:
         UNREACHABLE();
@@ -702,7 +702,7 @@ class GetUserFullInfoRequest final : public RequestActor<> {
   UserId user_id_;
 
   void do_run(Promise<Unit> &&promise) final {
-    td->contacts_manager_->load_user_full(user_id_, get_tries() < 2, std::move(promise));
+    td->contacts_manager_->load_user_full(user_id_, get_tries() < 2, std::move(promise), "GetUserFullInfoRequest");
   }
 
   void do_send_result() final {
@@ -772,7 +772,8 @@ class GetSupergroupFullInfoRequest final : public RequestActor<> {
   ChannelId channel_id_;
 
   void do_run(Promise<Unit> &&promise) final {
-    td->contacts_manager_->load_channel_full(channel_id_, get_tries() < 2, std::move(promise));
+    td->contacts_manager_->load_channel_full(channel_id_, get_tries() < 2, std::move(promise),
+                                             "GetSupergroupFullInfoRequest");
   }
 
   void do_send_result() final {
@@ -1940,39 +1941,6 @@ class UpgradeGroupChatToSupergroupChatRequest final : public RequestActor<> {
  public:
   UpgradeGroupChatToSupergroupChatRequest(ActorShared<Td> td, uint64 request_id, int64 dialog_id)
       : RequestActor(std::move(td), request_id), dialog_id_(dialog_id) {
-  }
-};
-
-class GetChatMemberRequest final : public RequestActor<> {
-  DialogId dialog_id_;
-  tl_object_ptr<td_api::MessageSender> participant_id_;
-  int64 random_id_;
-
-  DialogParticipant dialog_participant_;
-
-  void do_run(Promise<Unit> &&promise) final {
-    dialog_participant_ = td->contacts_manager_->get_dialog_participant(dialog_id_, participant_id_, random_id_,
-                                                                        get_tries() < 3, std::move(promise));
-  }
-
-  void do_send_result() final {
-    auto participant_dialog_id = dialog_participant_.dialog_id;
-    bool is_user = participant_dialog_id.get_type() == DialogType::User;
-    if ((is_user && !td->contacts_manager_->have_user(participant_dialog_id.get_user_id())) ||
-        (!is_user && !td->messages_manager_->have_dialog(participant_dialog_id))) {
-      return send_error(Status::Error(3, "Member not found"));
-    }
-    send_result(td->contacts_manager_->get_chat_member_object(dialog_participant_));
-  }
-
- public:
-  GetChatMemberRequest(ActorShared<Td> td, uint64 request_id, int64 dialog_id,
-                       tl_object_ptr<td_api::MessageSender> participant_id)
-      : RequestActor(std::move(td), request_id)
-      , dialog_id_(dialog_id)
-      , participant_id_(std::move(participant_id))
-      , random_id_(0) {
-    set_tries(3);
   }
 };
 
@@ -3598,6 +3566,8 @@ bool Td::is_internal_config_option(Slice name) {
              name == "rating_e_decay" || name == "recent_stickers_limit";
     case 's':
       return name == "saved_animations_limit";
+    case 'v':
+      return name == "video_note_size_max";
     case 'w':
       return name == "webfile_dc_id";
     default:
@@ -4287,6 +4257,15 @@ void Td::init_options_and_network() {
   }
   if (!G()->shared_config().have_option("message_caption_length_max")) {
     G()->shared_config().set_option_integer("message_caption_length_max", 1024);
+  }
+  if (!G()->shared_config().have_option("suggested_video_note_length")) {
+    G()->shared_config().set_option_integer("suggested_video_note_length", 384);
+  }
+  if (!G()->shared_config().have_option("suggested_video_note_video_bitrate")) {
+    G()->shared_config().set_option_integer("suggested_video_note_video_bitrate", 1000);
+  }
+  if (!G()->shared_config().have_option("suggested_video_note_audio_bitrate")) {
+    G()->shared_config().set_option_integer("suggested_video_note_audio_bitrate", 64);
   }
 
   init_connection_creator();
@@ -5157,8 +5136,9 @@ void Td::on_request(uint64 id, const td_api::getMessageThread &request) {
 }
 
 void Td::on_request(uint64 id, const td_api::getMessageLink &request) {
-  auto r_message_link = messages_manager_->get_message_link(
-      {DialogId(request.chat_id_), MessageId(request.message_id_)}, request.for_album_, request.for_comment_);
+  auto r_message_link =
+      messages_manager_->get_message_link({DialogId(request.chat_id_), MessageId(request.message_id_)},
+                                          request.media_timestamp_, request.for_album_, request.for_comment_);
   if (r_message_link.is_error()) {
     send_closure(actor_id(this), &Td::send_error, id, r_message_link.move_as_error());
   } else {
@@ -6491,7 +6471,9 @@ void Td::on_request(uint64 id, td_api::transferChatOwnership &request) {
 }
 
 void Td::on_request(uint64 id, td_api::getChatMember &request) {
-  CREATE_REQUEST(GetChatMemberRequest, request.chat_id_, std::move(request.member_id_));
+  CREATE_REQUEST_PROMISE();
+  contacts_manager_->get_dialog_participant(DialogId(request.chat_id_), std::move(request.member_id_),
+                                            std::move(promise));
 }
 
 void Td::on_request(uint64 id, td_api::searchChatMembers &request) {
@@ -6697,6 +6679,14 @@ void Td::on_request(uint64 id, const td_api::cancelDownloadFile &request) {
   file_manager_->download(FileId(request.file_id_, 0), nullptr, request.only_if_pending_ ? -1 : 0, -1, -1);
 
   send_closure(actor_id(this), &Td::send_result, id, make_tl_object<td_api::ok>());
+}
+
+void Td::on_request(uint64 id, const td_api::getSuggestedFileName &request) {
+  Result<string> r_file_name = file_manager_->get_suggested_file_name(FileId(request.file_id_, 0), request.directory_);
+  if (r_file_name.is_error()) {
+    return send_closure(actor_id(this), &Td::send_error, id, r_file_name.move_as_error());
+  }
+  send_closure(actor_id(this), &Td::send_result, id, td_api::make_object<td_api::text>(r_file_name.ok()));
 }
 
 void Td::on_request(uint64 id, td_api::uploadFile &request) {
@@ -8391,7 +8381,7 @@ td_api::object_ptr<td_api::Object> Td::do_static_request(const td_api::getTextEn
     return make_error(400, "Text must be encoded in UTF-8");
   }
   auto text_entities = find_entities(request.text_, false);
-  return make_tl_object<td_api::textEntities>(get_text_entities_object(text_entities));
+  return make_tl_object<td_api::textEntities>(get_text_entities_object(text_entities, false));
 }
 
 td_api::object_ptr<td_api::Object> Td::do_static_request(td_api::parseTextEntities &request) {
@@ -8425,7 +8415,8 @@ td_api::object_ptr<td_api::Object> Td::do_static_request(td_api::parseTextEntiti
     return make_error(400, PSLICE() << "Can't parse entities: " << r_entities.error().message());
   }
 
-  return make_tl_object<td_api::formattedText>(std::move(request.text_), get_text_entities_object(r_entities.ok()));
+  return make_tl_object<td_api::formattedText>(std::move(request.text_),
+                                               get_text_entities_object(r_entities.ok(), false));
 }
 
 td_api::object_ptr<td_api::Object> Td::do_static_request(td_api::parseMarkdown &request) {
@@ -8445,7 +8436,7 @@ td_api::object_ptr<td_api::Object> Td::do_static_request(td_api::parseMarkdown &
 
   auto parsed_text = parse_markdown_v3({std::move(request.text_->text_), std::move(entities)});
   fix_formatted_text(parsed_text.text, parsed_text.entities, true, true, true, true).ensure();
-  return get_formatted_text_object(parsed_text);
+  return get_formatted_text_object(parsed_text, true);
 }
 
 td_api::object_ptr<td_api::Object> Td::do_static_request(td_api::getMarkdownText &request) {
@@ -8463,7 +8454,7 @@ td_api::object_ptr<td_api::Object> Td::do_static_request(td_api::getMarkdownText
     return make_error(400, status.error().message());
   }
 
-  return get_formatted_text_object(get_markdown_v3({std::move(request.text_->text_), std::move(entities)}));
+  return get_formatted_text_object(get_markdown_v3({std::move(request.text_->text_), std::move(entities)}), true);
 }
 
 td_api::object_ptr<td_api::Object> Td::do_static_request(const td_api::getFileMimeType &request) {
